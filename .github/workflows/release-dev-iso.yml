@@ -42,7 +42,7 @@ jobs:
           # its current "docker run -it" invocation on GitHub-hosted runners.
           script -q -e -c './build.sh' /dev/null
 
-      - name: Derive release tag from ISO name
+      - name: Package split ISO release assets
         id: iso
         working-directory: JappeOS-Build
         run: |
@@ -70,36 +70,173 @@ jobs:
           (
             cd "$artifact_dir"
             sha256sum "$iso_name" > "$iso_name.sha256"
+            split -b 1900M "$iso_name" "$iso_name.part-"
+            rm "$iso_name"
+
+            cat > assemble-jappeos-iso.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          shopt -s nullglob
+          parts=(*.iso.part-*)
+          checksums=(*.iso.sha256)
+
+          if (( ${#parts[@]} == 0 )); then
+            echo "No ISO part files found. Download all *.iso.part-* files first." >&2
+            exit 1
+          fi
+
+          if (( ${#checksums[@]} != 1 )); then
+            echo "Expected exactly one *.iso.sha256 file, found ${#checksums[@]}." >&2
+            exit 1
+          fi
+
+          checksum_file="${checksums[0]}"
+          iso_name="$(awk '{print $2}' "$checksum_file")"
+
+          if [[ -z "$iso_name" || "$iso_name" == */* ]]; then
+            echo "Checksum file does not contain a valid ISO filename." >&2
+            exit 1
+          fi
+
+          printf '%s\n' "${parts[@]}" | sort | xargs cat > "$iso_name"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$checksum_file"
+          elif command -v shasum >/dev/null 2>&1; then
+            expected="$(awk '{print $1}' "$checksum_file")"
+            actual="$(shasum -a 256 "$iso_name" | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "$iso_name: FAILED" >&2
+              exit 1
+            fi
+            echo "$iso_name: OK"
+          else
+            echo "No SHA-256 tool found. Install sha256sum or shasum and rerun this script." >&2
+            exit 1
+          fi
+
+          echo "Created $iso_name"
+          EOF
+
+            cat > assemble-jappeos-iso.ps1 <<'EOF'
+          $ErrorActionPreference = "Stop"
+
+          $parts = Get-ChildItem -File -Filter "*.iso.part-*" | Sort-Object Name
+          if ($parts.Count -eq 0) {
+            throw "No ISO part files found. Download all *.iso.part-* files first."
+          }
+
+          $checksums = Get-ChildItem -File -Filter "*.iso.sha256"
+          if ($checksums.Count -ne 1) {
+            throw "Expected exactly one *.iso.sha256 file, found $($checksums.Count)."
+          }
+
+          $checksumLine = Get-Content -LiteralPath $checksums[0].FullName -TotalCount 1
+          if ($checksumLine -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+\.iso)$') {
+            throw "Checksum file does not contain a valid SHA-256 entry."
+          }
+
+          $expectedHash = $Matches[1].ToLowerInvariant()
+          $isoName = Split-Path -Leaf $Matches[2]
+
+          $output = [System.IO.File]::Open($isoName, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+          try {
+            foreach ($part in $parts) {
+              $input = [System.IO.File]::OpenRead($part.FullName)
+              try {
+                $input.CopyTo($output)
+              }
+              finally {
+                $input.Dispose()
+              }
+            }
+          }
+          finally {
+            $output.Dispose()
+          }
+
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $isoName).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            Remove-Item -LiteralPath $isoName -Force
+            throw "$isoName verification failed. Delete the parts and download them again."
+          }
+
+          Write-Host "$isoName: OK"
+          Write-Host "Created $isoName"
+          EOF
+
+            chmod +x assemble-jappeos-iso.sh
           )
 
           {
-            echo "path=$artifact_dir/$iso_name"
             echo "name=$iso_name"
-            echo "sha256=$artifact_dir/$iso_name.sha256"
             echo "tag=$release_tag"
+            echo "artifact_dir=$artifact_dir"
+            echo "part_count=$(find "$artifact_dir" -maxdepth 1 -type f -name "$iso_name.part-*" | wc -l)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.iso.outputs.tag }}
-          ISO_PATH: ${{ steps.iso.outputs.path }}
           ISO_NAME: ${{ steps.iso.outputs.name }}
-          SHA256_PATH: ${{ steps.iso.outputs.sha256 }}
+          ARTIFACT_DIR: ${{ steps.iso.outputs.artifact_dir }}
+          PART_COUNT: ${{ steps.iso.outputs.part_count }}
         run: |
           set -euo pipefail
 
-          notes="Automated JappeOS dev ISO build.
+          notes_file="$RUNNER_TEMP/jappeos-release-notes.md"
+          cat > "$notes_file" <<EOF
+          Automated JappeOS dev ISO build.
 
-          Build source: JappeOS/JappeOS-Build@${{ inputs.build_ref }}
-          ISO: ${ISO_NAME}"
+          GitHub requires each release asset to be under 2 GiB, so the ISO is split into ${PART_COUNT} parts.
+
+          ## Download
+
+          Download every file whose name starts with:
+
+          \`${ISO_NAME}.part-\`
+
+          Also download:
+
+          - \`${ISO_NAME}.sha256\`
+          - \`assemble-jappeos-iso.sh\` for Linux or macOS
+          - \`assemble-jappeos-iso.ps1\` for Windows PowerShell
+
+          ## Assemble and verify
+
+          Linux or macOS:
+
+          \`\`\`bash
+          chmod +x assemble-jappeos-iso.sh
+          ./assemble-jappeos-iso.sh
+          \`\`\`
+
+          Windows PowerShell:
+
+          \`\`\`powershell
+          .\\assemble-jappeos-iso.ps1
+          \`\`\`
+
+          The assembly scripts recreate \`${ISO_NAME}\` and verify it against \`${ISO_NAME}.sha256\`.
+
+          Build source: \`JappeOS/JappeOS-Build@${{ inputs.build_ref }}\`
+          EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ISO_PATH" "$SHA256_PATH" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes_file" \
+              --prerelease
+            while IFS= read -r asset_name; do
+              gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes
+            done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+            gh release upload "$RELEASE_TAG" "$ARTIFACT_DIR"/* --clobber
           else
-            gh release create "$RELEASE_TAG" "$ISO_PATH" "$SHA256_PATH" \
+            gh release create "$RELEASE_TAG" "$ARTIFACT_DIR"/* \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
-              --notes "$notes" \
+              --notes-file "$notes_file" \
               --prerelease
           fi

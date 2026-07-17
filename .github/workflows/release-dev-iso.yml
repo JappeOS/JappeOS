@@ -1,0 +1,105 @@
+name: Release dev ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: JappeOS-Build branch, tag, or commit to build
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dev-iso
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and release ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+        with:
+          repository: JappeOS/JappeOS-Build
+          ref: ${{ inputs.build_ref }}
+          path: JappeOS-Build
+
+      - name: Build ISO
+        working-directory: JappeOS-Build
+        run: |
+          set -euo pipefail
+          chmod +x ./build.sh
+
+          # build.sh already runs Docker. The script wrapper provides a TTY for
+          # its current "docker run -it" invocation on GitHub-hosted runners.
+          script -q -e -c './build.sh' /dev/null
+
+      - name: Derive release tag from ISO name
+        id: iso
+        working-directory: JappeOS-Build
+        run: |
+          set -euo pipefail
+          mapfile -t isos < <(find out -maxdepth 1 -type f -name '*.iso' -printf '%T@ %p\n' | sort -nr | awk '{print $2}')
+
+          if [[ "${#isos[@]}" -eq 0 ]]; then
+            echo "No ISO files found in JappeOS-Build/out" >&2
+            exit 1
+          fi
+
+          iso_path="${isos[0]}"
+          iso_name="$(basename "$iso_path")"
+
+          if [[ ! "$iso_name" =~ ^JappeOS-([0-9]{4}\.[0-9]{2}\.[0-9]{2})-.+\.iso$ ]]; then
+            echo "ISO name does not match expected format: $iso_name" >&2
+            exit 1
+          fi
+
+          release_tag="dev-${BASH_REMATCH[1]}"
+          artifact_dir="$RUNNER_TEMP/jappeos-release"
+          mkdir -p "$artifact_dir"
+
+          cp "$iso_path" "$artifact_dir/$iso_name"
+          (
+            cd "$artifact_dir"
+            sha256sum "$iso_name" > "$iso_name.sha256"
+          )
+
+          {
+            echo "path=$artifact_dir/$iso_name"
+            echo "name=$iso_name"
+            echo "sha256=$artifact_dir/$iso_name.sha256"
+            echo "tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.iso.outputs.tag }}
+          ISO_PATH: ${{ steps.iso.outputs.path }}
+          ISO_NAME: ${{ steps.iso.outputs.name }}
+          SHA256_PATH: ${{ steps.iso.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          notes="Automated JappeOS dev ISO build.
+
+          Build source: JappeOS/JappeOS-Build@${{ inputs.build_ref }}
+          ISO: ${ISO_NAME}"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ISO_PATH" "$SHA256_PATH" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$ISO_PATH" "$SHA256_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --notes "$notes" \
+              --prerelease
+          fi

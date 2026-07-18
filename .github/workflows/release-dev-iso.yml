@@ -122,12 +122,12 @@ jobs:
             cat > assemble-jappeos-iso.ps1 <<'EOF'
           $ErrorActionPreference = "Stop"
 
-          $parts = Get-ChildItem -File -Filter "*.iso.part-*" | Sort-Object Name
+          $parts = Get-ChildItem -Path $PSScriptRoot -File -Filter "*.iso.part-*" | Sort-Object Name
           if ($parts.Count -eq 0) {
             throw "No ISO part files found. Download all *.iso.part-* files first."
           }
 
-          $checksums = Get-ChildItem -File -Filter "*.iso.sha256"
+          $checksums = Get-ChildItem -Path $PSScriptRoot -File -Filter "*.iso.sha256"
           if ($checksums.Count -ne 1) {
             throw "Expected exactly one *.iso.sha256 file, found $($checksums.Count)."
           }
@@ -139,8 +139,9 @@ jobs:
 
           $expectedHash = $Matches[1].ToLowerInvariant()
           $isoName = Split-Path -Leaf $Matches[2]
-
-          $output = [System.IO.File]::Open($isoName, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+          $isoPath = Join-Path $PSScriptRoot $isoName
+          
+          $output = [System.IO.File]::Open($isoPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
           try {
             foreach ($part in $parts) {
               $input = [System.IO.File]::OpenRead($part.FullName)
@@ -156,9 +157,9 @@ jobs:
             $output.Dispose()
           }
 
-          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $isoName).Hash.ToLowerInvariant()
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $isoPath).Hash.ToLowerInvariant()
           if ($actualHash -ne $expectedHash) {
-            Remove-Item -LiteralPath $isoName -Force
+            Remove-Item -LiteralPath $isoPath -Force
             throw "$isoName verification failed. Delete the parts and download them again."
           }
 

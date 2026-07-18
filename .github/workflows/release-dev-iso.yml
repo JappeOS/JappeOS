@@ -162,7 +162,7 @@ jobs:
             throw "$isoName verification failed. Delete the parts and download them again."
           }
 
-          Write-Host "$isoName: OK"
+          Write-Host "${isoName}: OK"
           Write-Host "Created $isoName"
           EOF
 
